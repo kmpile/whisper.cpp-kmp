@@ -81,6 +81,32 @@ whisper.cpp is a submodule — clone with `--recurse-submodules` (or run
 - **iOS/macOS**: run `native/cpp/build-ios.sh` on a Mac, then build the `:core`
   apple targets.
 
+## Versioning & releases
+
+Versions track upstream whisper.cpp release tags (e.g. `v1.8.6`); binding-only
+revisions on the same upstream append a numeric suffix (`v1.8.6.1`), which
+Maven and Gradle order correctly: `v1.8.6 < v1.8.6.1 < v1.8.7`.
+[sync-whispercpp.yml](.github/workflows/sync-whispercpp.yml) polls upstream
+daily and bumps the pinned submodule.
+
+Every push to `main` publishes a SNAPSHOT of the next version (e.g.
+`v1.8.6.1-SNAPSHOT`) to the [Central Portal snapshots
+repo](https://central.sonatype.com/repository/maven-snapshots/) via
+[publish.yml](.github/workflows/publish.yml). Consume it with:
+
+```kotlin
+repositories {
+    maven("https://central.sonatype.com/repository/maven-snapshots/")
+}
+configurations.all {
+    resolutionStrategy.cacheChangingModulesFor(0, "seconds")
+}
+```
+
+Immutable releases to Maven Central are currently disabled — snapshots are
+the only published artifacts (see the header comment in publish.yml for how
+to re-enable releases).
+
 ## License
 
 MIT — see [LICENSE.md](LICENSE.md). whisper.cpp is MIT-licensed by its authors.

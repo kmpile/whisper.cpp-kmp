@@ -1,15 +1,31 @@
 name: Publish
 
-# Triggered when a release (created as a draft by Sync whisper.cpp, tagged with
-# the upstream whisper.cpp version) is published. The Maven version is taken from
-# that tag via -PVERSION_NAME=${{ github.ref_name }}, so the published
-# com.kmpile:whisper-cpp-kmp:<version> matches the bundled whisper.cpp release.
+# Publishes a SNAPSHOT of main to the Central Portal snapshots repo
+# (https://central.sonatype.com/repository/maven-snapshots/) on every push, so
+# every commit is consumable without shipping anything immutable. Version =
+# <upstream whisper.cpp tag>.<next binding revision>-SNAPSHOT, e.g.
+# v1.8.6.1-SNAPSHOT — a stable coordinate consumers resolve to the newest build
+# (Gradle: cacheChangingModulesFor(0, "seconds")). The vanniktech plugin routes
+# -SNAPSHOT versions to the snapshots repo automatically.
+#
+# Immutable releases to Maven Central are DISABLED for now. To re-enable:
+# restore `release: types: [released, prereleased]` below, publish with
+# -PVERSION_NAME=<tag> on release events, and re-add a step uploading the
+# per-target jars/klibs/aar from ~/.m2 to the release page.
 on:
-  release:
-    types: [released, prereleased]
+  push:
+    branches: [main]
+  # sync-whispercpp.yml dispatches this after its bump commit: GITHUB_TOKEN
+  # pushes don't trigger `push` workflows.
+  workflow_dispatch:
+
+# Rapid pushes supersede each other's snapshot.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
-  contents: write # upload per-target artifacts to the release page
+  contents: read
 
 jobs:
   desktop-native:
@@ -23,51 +39,97 @@ jobs:
           - { os: windows-latest, platform: windows }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
+      # As upstream: warm rebuilds of unchanged whisper.cpp sources come from ccache.
+      # Not on Windows — MSVC needs the LLVM toolchain for ccache (upstream's CI
+      # skips it there too).
+      - name: ccache
+        if: matrix.platform != 'windows'
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: desktop-jni-${{ matrix.platform }}
       - name: Build desktop JNI native
-        run: ./gradlew :core:copyDesktopJni --stacktrace
-      - uses: actions/upload-artifact@v4
+        run: ./gradlew :core:copyDesktopJni --console=plain
+      - uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.platform }}
+          # Upload the `native/` parent so the artifact keeps its <os>/ subfolder.
           path: core/build/generated/jvmNativeResources/native
 
   publish:
-    name: Release build and publish
+    name: Snapshot build and publish
     needs: [desktop-native]
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out code
+        uses: actions/checkout@v6
         with:
           submodules: recursive
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
-      - uses: android-actions/setup-android@v3
-      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
-      - uses: gradle/actions/setup-gradle@v4
+      # The publish builds the Android AAR (via :native's CMake/NDK build), and macOS
+      # runners ship without the Android SDK — install it plus the pinned NDK/CMake.
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK packages (NDK + CMake pinned by :native)
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+      - uses: gradle/actions/setup-gradle@v6
       - name: Download desktop natives (macOS + Linux + Windows)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: native-*
           merge-multiple: true
           path: core/build/generated/jvmNativeResources/native
+      # Speeds up the NDK/ninja Android native build; the iOS static-lib build
+      # ignores compiler launchers and builds cold regardless.
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: publish-android
       - name: Build whisper.cpp Apple static libs
         run: bash native/cpp/build-ios.sh
-      - name: Publish to Maven Local + Central (all modules, all platforms)
+      - name: Resolve snapshot version (next binding revision on the upstream tag)
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The checkout's submodules are shallow and tag-less, so git describe
+          # can't name the pinned commit; resolve its tag from upstream's refs
+          # instead (ls-remote lists them without fetching objects).
+          sha=$(git -C native/cpp/whisper.cpp rev-parse HEAD)
+          base=$(git ls-remote --tags https://github.com/ggml-org/whisper.cpp.git \
+            | awk -v sha="$sha" '$1 == sha && $2 !~ /\^\{\}$/ {sub("refs/tags/","",$2); print $2}' | tail -1)
+          [ -n "$base" ] || { echo "::error::no upstream tag points at whisper.cpp commit $sha"; exit 1; }
+          # If vX.Y.Z.N releases ever ship, the snapshot moves past the highest one.
+          last=$(gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | grep -E "^${base}\.[0-9]+$" | sed "s/^${base}\.//" | sort -n | tail -1)
+          version="${base}.$(( ${last:-0} + 1 ))-SNAPSHOT"
+          echo "version=$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Build and publish are separate steps (same runner, warm Gradle state) so
+      # compile output and publish/signing/upload output land in separate logs
+      # and a failure is attributable at a glance.
+      - name: Build all targets
         run: >
-          ./gradlew publishToMavenLocal publishToMavenCentral
+          ./gradlew assemble
           -PwhisperkmpPrebuiltNatives=true
-          -PVERSION_NAME=${{ github.ref_name }}
+          -PVERSION_NAME=${{ steps.ver.outputs.version }}
+      - name: Publish to Central snapshots (all modules, all platforms)
+        run: >
+          ./gradlew publishToMavenCentral
+          -PwhisperkmpPrebuiltNatives=true
+          -PVERSION_NAME=${{ steps.ver.outputs.version }}
           -PmavenCentralUsername=${{ secrets.MAVEN_USERNAME }}
           -PmavenCentralPassword=${{ secrets.MAVEN_PASSWORD }}
           -PsigningInMemoryKeyPassword=${{ secrets.SIGNING_PASSWORD }}
@@ -76,14 +138,3 @@ jobs:
           MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
-      - name: Attach per-target artifacts to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          dir=$(mktemp -d)
-          find ~/.m2/repository/com/kmpile -type f \( \
-            -name "*-${{ github.ref_name }}.jar" -o \
-            -name "*-${{ github.ref_name }}.klib" -o \
-            -name "*-${{ github.ref_name }}.aar" \) -exec cp {} "$dir/" \;
-          echo "Uploading:"; ls -1 "$dir"
-          gh release upload "${{ github.ref_name }}" "$dir"/* --clobber

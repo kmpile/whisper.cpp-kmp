@@ -1,17 +1,22 @@
-name: build
+name: Build
 
+# Branch/PR gate: builds the JVM/desktop JNI library on each OS, verifies the
+# wasmJs target, and assembles a cross-OS desktop jar. Not run on main — every
+# main push runs Publish, which compiles all of this anyway (a snapshot can't
+# publish without it), so running Build there would do the work twice.
 on:
   push:
-    branches: [ main ]
-  pull_request:
+    branches-ignore: [main]
   workflow_dispatch:
 
+# Newer runs on a branch cancel any still-in-progress run on the same branch,
+# so superseded commits don't tie up the (slow) per-OS native build matrix.
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Compiles the host-agnostic Kotlin (JVM + Wasm) — no native libs required.
+  # Compiles the host-agnostic Kotlin (JVM + Wasm + Android) — no native libs required.
   kotlin:
     runs-on: ubuntu-latest
     steps:
@@ -25,14 +30,18 @@ jobs:
       - uses: android-actions/setup-android@v4
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew :core:compileKotlinJvm :core:compileKotlinWasmJs :core:compileAndroidMain --stacktrace
+      - run: ./gradlew :core:compileKotlinJvm :core:compileKotlinWasmJs :core:compileAndroidMain --console=plain
 
-  # Builds the desktop JNI native (whisper.cpp from source) + the JVM jar, per OS.
-  desktop:
+  # Builds the desktop JNI native (whisper.cpp from source), per OS.
+  desktop-native:
+    name: whisperkmp-jni (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
+        include:
+          - { os: macos-latest,   platform: macos }
+          - { os: ubuntu-latest,  platform: linux }
+          - { os: windows-latest, platform: windows }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -45,10 +54,26 @@ jobs:
       - uses: android-actions/setup-android@v4
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew :core:buildDesktopJni :core:jvmJar --stacktrace
+      # As upstream: warm rebuilds of unchanged whisper.cpp sources come from ccache.
+      # Not on Windows — MSVC needs the LLVM toolchain for ccache (upstream's CI
+      # skips it there too).
+      - name: ccache
+        if: matrix.platform != 'windows'
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: desktop-jni-${{ matrix.platform }}
+      - name: Build desktop JNI native
+        run: ./gradlew :core:copyDesktopJni --console=plain
+      - name: Upload per-OS native
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.platform }}
+          # Upload the `native/` parent so the artifact keeps its <os>/ subfolder.
+          path: core/build/generated/jvmNativeResources/native
 
   # Builds the Android AAR with the JNI .so (NDK + CMake) for arm64-v8a + x86_64.
   android:
+    name: Android native (.so arm64-v8a + x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -61,7 +86,11 @@ jobs:
       - uses: android-actions/setup-android@v4
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
       - uses: gradle/actions/setup-gradle@v6
-      - run: ./gradlew :native:assembleRelease --stacktrace
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: android-native
+      - run: ./gradlew :native:assembleRelease --console=plain
       - uses: actions/upload-artifact@v7
         with:
           name: android-aar
@@ -69,7 +98,33 @@ jobs:
 
   # Builds the Apple static libs (Metal) and runs cinterop + iOS Kotlin compile.
   apple:
+    name: Apple static libs + iOS Kotlin compile
     runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      # Configuring the :core Android target needs the SDK even for iOS tasks,
+      # and macOS runners ship without it.
+      - uses: android-actions/setup-android@v4
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Build whisper.cpp Apple static libs
+        run: bash native/cpp/build-ios.sh
+      - name: Compile iOS Kotlin targets (cinterop + klibs)
+        run: >
+          ./gradlew
+          :core:compileKotlinIosArm64 :core:compileKotlinIosSimulatorArm64 :core:compileKotlinIosX64
+          --console=plain
+
+  jvm-jar:
+    name: JVM jar (all-OS natives bundled)
+    needs: [desktop-native]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
@@ -81,6 +136,11 @@ jobs:
       - uses: android-actions/setup-android@v4
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
       - uses: gradle/actions/setup-gradle@v6
-      - name: Build whisper.cpp Apple static libs
-        run: bash native/cpp/build-ios.sh
-      - run: ./gradlew :core:compileKotlinIosArm64 :core:compileKotlinIosSimulatorArm64 :core:compileKotlinIosX64 --stacktrace
+      - name: Download all per-OS natives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: core/build/generated/jvmNativeResources/native
+      - name: Bundle the JVM jar with macOS + Linux + Windows natives
+        run: ./gradlew :core:jvmJar -PwhisperkmpPrebuiltNatives=true --console=plain
