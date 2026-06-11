@@ -1,0 +1,89 @@
+name: Publish
+
+# Triggered when a release (created as a draft by Sync whisper.cpp, tagged with
+# the upstream whisper.cpp version) is published. The Maven version is taken from
+# that tag via -PVERSION_NAME=${{ github.ref_name }}, so the published
+# com.kmpile:whisper-cpp-kmp:<version> matches the bundled whisper.cpp release.
+on:
+  release:
+    types: [released, prereleased]
+
+permissions:
+  contents: write # upload per-target artifacts to the release page
+
+jobs:
+  desktop-native:
+    name: whisperkmp-jni (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   platform: macos }
+          - { os: ubuntu-latest,  platform: linux }
+          - { os: windows-latest, platform: windows }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build desktop JNI native
+        run: ./gradlew :core:copyDesktopJni --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: core/build/generated/jvmNativeResources/native
+
+  publish:
+    name: Release build and publish
+    needs: [desktop-native]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Download desktop natives (macOS + Linux + Windows)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: core/build/generated/jvmNativeResources/native
+      - name: Build whisper.cpp Apple static libs
+        run: bash native/cpp/build-ios.sh
+      - name: Publish to Maven Local + Central (all modules, all platforms)
+        run: >
+          ./gradlew publishToMavenLocal publishToMavenCentral
+          -PwhisperkmpPrebuiltNatives=true
+          -PVERSION_NAME=${{ github.ref_name }}
+          -PmavenCentralUsername=${{ secrets.MAVEN_USERNAME }}
+          -PmavenCentralPassword=${{ secrets.MAVEN_PASSWORD }}
+          -PsigningInMemoryKeyPassword=${{ secrets.SIGNING_PASSWORD }}
+        env:
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+      - name: Attach per-target artifacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dir=$(mktemp -d)
+          find ~/.m2/repository/com/kmpile -type f \( \
+            -name "*-${{ github.ref_name }}.jar" -o \
+            -name "*-${{ github.ref_name }}.klib" -o \
+            -name "*-${{ github.ref_name }}.aar" \) -exec cp {} "$dir/" \;
+          echo "Uploading:"; ls -1 "$dir"
+          gh release upload "${{ github.ref_name }}" "$dir"/* --clobber

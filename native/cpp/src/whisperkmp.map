@@ -1,0 +1,14 @@
+/* Linker version script: export only the public whisper-kmp C API from the
+   shared library; hide everything else (our internals + symbols pulled in from
+   the statically-linked whisper/ggml). */
+WHISPERKMP {
+    global:
+        whisperkmp_init_from_file;
+        whisperkmp_is_multilingual;
+        whisperkmp_full;
+        whisperkmp_cancel;
+        whisperkmp_free;
+        whisperkmp_system_info;
+    local:
+        *;
+};
